@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from typing import TypedDict
 
 from langgraph.graph import StateGraph, START, END
@@ -9,17 +9,28 @@ class UserState(TypedDict):
     surname: str
     age: int
     birth_date: date
+    today: date
     message: str
 
 
 def calculate_age(state: UserState) -> dict[str, int]:
-    today = date.today()
+    today = state["today"]
     age = today.year - state["birth_date"].year
 
     if (today.month, today.day) < (state["birth_date"].month, state["birth_date"].day):
         age -= 1
 
     return {"age": age}
+
+
+def autoincrement_date(state: UserState) -> dict:
+    """
+    Увеличивает текущую дату на один день.
+    """
+    current_date = state["today"]
+    new_date = current_date + timedelta(days=1)
+    print(f"{current_date} -> {new_date}")
+    return {"today": new_date}
 
 
 def check_drive(state: UserState) -> str:
@@ -43,6 +54,7 @@ def generate_failure_message(state: UserState) -> dict[str, str]:
 graph = StateGraph(UserState)
 
 graph.add_node("calculate_age", calculate_age)
+graph.add_node("autoincrement_date", autoincrement_date)
 graph.add_node("generate_success_message", generate_success_message)
 graph.add_node("generate_failure_message", generate_failure_message)
 
@@ -52,11 +64,11 @@ graph.add_conditional_edges(
     check_drive,
     {
         "можно": "generate_success_message",
-        "нельзя": "generate_failure_message",
+        "нельзя": "autoincrement_date",
     }
 )
 graph.add_edge("generate_success_message", END)
-graph.add_edge("generate_failure_message", END)
+graph.add_edge("autoincrement_date", "calculate_age")
 
 app = graph.compile()
 
@@ -64,8 +76,10 @@ result = app.invoke(
     {
         "name": "Валерия",
         "surname": "Качановская",
-        "birth_date": date.fromisoformat("2003-12-05"),
-    }
+        "birth_date": date.fromisoformat("2008-08-05"),
+        "today": date.today()
+    },
+    {"recursion_limit": 1000}
 )
 print(result)
 
