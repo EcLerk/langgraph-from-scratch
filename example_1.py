@@ -3,6 +3,8 @@ from typing import TypedDict
 
 from langgraph.graph import StateGraph, START, END
 
+from utils import gen_png_graph
+
 
 class UserState(TypedDict):
     name: str
@@ -71,6 +73,7 @@ graph.add_edge("generate_success_message", END)
 graph.add_edge("autoincrement_date", "calculate_age")
 
 app = graph.compile()
+gen_png_graph(app_obj=app)
 
 result = app.invoke(
     {
