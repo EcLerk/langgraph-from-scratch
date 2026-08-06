@@ -1,9 +1,9 @@
+import json
 import logging
 from typing import TypedDict
-from tenacity import retry, stop_after_attempt, wait_fixed
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 
 from langgraph.constants import START, END
 from langgraph.graph import StateGraph
@@ -11,135 +11,215 @@ from langgraph.graph import StateGraph
 from dotenv import load_dotenv
 import os
 
+from parsers.analysis_parser import review_analysis_prompt, review_parser
+from parsers.classification_parser import classification_prompt, classification_parser
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 
 llm = ChatOpenAI(
-    model="llama-3.3-70b-versatile",
+    model="openai/gpt-oss-120b",
     base_url="https://api.groq.com/openai/v1",
     api_key=os.getenv("API_KEY")
 )
 
+classification_chain = classification_prompt | llm | classification_parser
+review_analysis_chain = review_analysis_prompt | llm | review_parser
 
-class ChatState(TypedDict):
+
+class SystemState(TypedDict):
     messages: list[BaseMessage]
+    current_user_input: str
+    message_type: str
     should_continue: bool
+    analysis_results: list[dict]
 
 
-class ContinueDecision(TypedDict):
-    should_continue: bool
-
-
-decision_llm = llm.with_structured_output(ContinueDecision, method="function_calling")
-
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_fixed(1),
-    before_sleep=lambda retry_state: print(f"Попытка {retry_state.attempt_number} неудачна, повторяю...")
-)
-def call_llm(messages: list[BaseMessage]) -> AIMessage:
-    return llm.invoke(messages)
-
-
-def user_input_node(state: ChatState) -> dict:
+def user_input_node(state: SystemState) -> dict:
     user_input = input("Вы: ")
-    new_messages = state["messages"] + [HumanMessage(content=user_input)]
 
-    return {"messages": new_messages, "should_continue": True}
+    if user_input.lower() in ["стат", "статистика", "results"]:
+        analysis_results = state.get("analysis_results", [])
+        if analysis_results:
+            print(f"\n📊 Проанализировано отзывов: {len(analysis_results)}")
+            sentiments = [r["analysis"]["sentiment"] for r in analysis_results]
+            print(
+                f"Положительные: {sentiments.count('pos')}, "
+                f"Отрицательные: {sentiments.count('neg')}, "
+                f"Нейтральные: {sentiments.count('neu')}"
+            )
+        else:
+            print("📊 Пока нет проанализированных отзывов")
+        return {"should_continue": True}
 
-
-def check_conversation_end_node(state: ChatState) -> dict[str, bool]:
-    last_user_message = state["messages"][-1]
-
-    decision = decision_llm.invoke([
-        SystemMessage(
-            content="Определи, хочет ли пользователь завершить разговор на основе его последнего "
-            "сообщения. Учитывай прощания, благодарности с намерением уйти, явные просьбы "
-            "закончить. Обычные вопросы или продолжение темы — это НЕ завершение."
-            ),
-        HumanMessage(content=f"Сообщение пользователя: {last_user_message.content}")
-    ])
-
-    return {"should_continue": decision["should_continue"]}
-
-
-def llm_response_node(state: ChatState) -> dict:
-    try:
-        response = call_llm(state["messages"])
-        msg_content = response.content
-    except Exception:
-        msg_content = "Извините, произошла ошибка. Попробуйте ещё раз."
-
-    print(f"ИИ: {msg_content}")
-    return {"messages": state["messages"] + [AIMessage(content=msg_content)]}
-
-
-def should_continue_node(state: ChatState) -> str:
-    return "continue" if state.get("should_continue", True) else "end"
-
-
-def farewell_node(state: ChatState) -> dict:
-    response = llm.invoke(
-        state["messages"] + [
-            SystemMessage(content="Пользователь завершает разговор. Попрощайся тепло и коротко, в одном предложении.")
-        ]
-    )
-    msg_content = response.content
-    print(f"ИИ: {msg_content}")
-
-    new_messages = state["messages"] + [AIMessage(content=msg_content)]
-    return {"messages": new_messages}
-
-
-graph = StateGraph(ChatState)
-
-graph.add_node("user_input_node", user_input_node)
-graph.add_node("check_conversation_end_node", check_conversation_end_node)
-graph.add_node("llm_response_node", llm_response_node)
-graph.add_node("farewell_node", farewell_node)
-
-graph.add_edge(START, "user_input_node")
-graph.add_edge("user_input_node", "check_conversation_end_node")
-graph.add_conditional_edges(
-    "check_conversation_end_node",
-    should_continue_node,
-    {
-        "continue": "llm_response_node",
-        "end": "farewell_node"
+    return {
+        "current_user_input": user_input,
+        "should_continue": True
     }
+
+
+def classify_message_node(state: SystemState) -> dict:
+    user_input = state["current_user_input"]
+    try:
+        print("🤔 Определяю тип сообщения...")
+
+        result = classification_chain.invoke({"user_input": user_input})
+
+        message_type = result["message_type"]
+        confidence = result["confidence"]
+
+        print(f"📝 Тип: {message_type} (уверенность: {confidence:.2f})")
+
+        return {"message_type": message_type}
+    except Exception as e:
+        print(f"❌ Ошибка классификации: {e}")
+        return {"message_type": "question"}
+
+
+def analyze_review_node(state: SystemState) -> dict:
+    user_input = state["current_user_input"]
+
+    try:
+        print("🔍 Анализирую отзыв...")
+
+        analysis_result = review_analysis_chain.invoke({"review": user_input})
+
+        full_result = {
+            "original_review": user_input,
+            "analysis": analysis_result
+        }
+
+        analysis_results = state.get("analysis_results", [])
+        new_analysis_results = analysis_results + [full_result]
+
+        print("\n" + "=" * 60)
+        print("📊 АНАЛИЗ ОТЗЫВА (JSON):")
+        print("=" * 60)
+        print(json.dumps(full_result, ensure_ascii=False, indent=2))
+        print("=" * 60)
+
+        messages = state["messages"]
+        new_messages = messages + [
+            HumanMessage(content=user_input),
+            AIMessage(
+                content=f"Отзыв проанализирован: {analysis_result['sentiment']} "
+                        f"тональность с уверенностью {analysis_result['confidence']:.2f}"
+            )
+        ]
+
+        return {
+            "messages": new_messages,
+            "analysis_results": new_analysis_results
+        }
+
+    except Exception as e:
+        print(f"❌ Ошибка анализа отзыва: {e}")
+
+        messages = state["messages"]
+        new_messages = messages + [
+            HumanMessage(content=user_input),
+            AIMessage(content="Извините, произошла ошибка при анализе отзыва.")
+        ]
+
+        return {"messages": new_messages}
+
+
+def answer_question_node(state: SystemState) -> dict:
+    user_input = state["current_user_input"]
+
+    try:
+        print("💬 Отвечаю на вопрос...")
+
+        messages = state["messages"] + [HumanMessage(content=user_input)]
+        response = llm.invoke(messages)
+        ai_response = response.content
+
+        print(f"🤖 ИИ: {ai_response}")
+
+        new_messages = messages + [AIMessage(content=ai_response)]
+        return {"messages": new_messages}
+
+    except Exception as e:
+        print(f"❌ Ошибка при ответе: {e}")
+
+        messages = state["messages"] + [
+            HumanMessage(content=user_input),
+            AIMessage(content="Извините, произошла ошибка при обработке вашего вопроса.")
+        ]
+        return {"messages": messages}
+
+
+def route_after_input(state: SystemState) -> str:
+    if not state.get("should_continue"):
+        return "end"
+    if state.get("current_user_input"):
+        return "classify"
+    return "get_input"
+
+
+def route_after_classification(state: SystemState) -> str:
+    message_type = state.get("message_type", "question")
+    return "analyze_review" if message_type == "review" else "answer_question"
+
+
+def route_continue(state: SystemState) -> str:
+    return "get_input" if state.get("should_continue", True) else "end"
+
+
+graph = StateGraph(SystemState)
+
+graph.add_node("get_input", user_input_node)
+graph.add_node("classify", classify_message_node)
+graph.add_node("analyze_review", analyze_review_node)
+graph.add_node("answer_question", answer_question_node)
+
+graph.add_edge(START, "get_input")
+graph.add_conditional_edges(
+    "get_input",
+    route_after_input,
+    {"classify": "classify", "get_input": "get_input", "end": END}
 )
-graph.add_edge("llm_response_node", "user_input_node")
-graph.add_edge("farewell_node", END)
+graph.add_conditional_edges(
+    "classify",
+    route_after_classification,
+    {"analyze_review": "analyze_review", "answer_question": "answer_question"}
+)
+graph.add_conditional_edges(
+    "analyze_review",
+    route_continue,
+    {"get_input": "get_input", "end": END}
+)
+graph.add_conditional_edges(
+    "answer_question",
+    route_continue,
+    {"get_input": "get_input", "end": END}
+)
 
 app = graph.compile()
 
-
 if __name__ == "__main__":
-    print("Добро пожаловать в чат с ИИ!")
-    print("-" * 50)
+    print("🤖 Умная система: Анализ отзывов + Чат-бот")
+    print("Введите отзыв - получите JSON анализ")
+    print("Задайте вопрос - получите ответ")
+    print("Команды: 'стат' - статистика, 'выход' - завершить")
+    print("-" * 60)
 
     initial_state = {
-        "messages": [
-            SystemMessage(
-                content="Ты дружелюбный помощник. Отвечай коротко и по делу."
-                        "Если пользователь прощается или хочет завершить разговор — тепло попрощайся в поле reply "
-                        "и отметь это в should_continue."
-            )
-        ],
-        "should_continue": True
+        "messages": [],
+        "current_user_input": "",
+        "message_type": "",
+        "should_continue": True,
+        "analysis_results": []
     }
 
     try:
         final_state = app.invoke(initial_state)
-
-        print("-" * 50)
-        print("Чат завершён. До свидания!")
-        print(f"Всего сообщений в диалоге: {len(final_state['messages'])}")
+        print("\n✅ Работа завершена!")
+        print(f"📝 Всего сообщений: {len(final_state.get('messages', []))}")
+        print(f"📊 Проанализировано отзывов: {len(final_state.get('analysis_results', []))}")
 
     except KeyboardInterrupt:
-        print("\n\nЧат прерван пользователем (Ctrl+C)")
+        print("\n\n⚠️ Работа прервана (Ctrl+C)")
     except Exception as e:
-        print(f"\nОшибка в работе чата: {e}")
+        print(f"\n❌ Ошибка системы: {e}")
